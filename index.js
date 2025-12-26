@@ -13,75 +13,72 @@ const BASE_FORM = {
   symbol_group: "1",
   currency: "USD",
   leverage: "2000",
-  lot: "1"
+  lot: "1",
 };
 
-// Проверь при желании соответствие type_account
 const ACCOUNTS = [
   { type_account: "1", account_type: "Classic" },
   { type_account: "2", account_type: "Market Pro" },
-  { type_account: "3", account_type: "ECN" }
+  { type_account: "3", account_type: "ECN" },
 ];
-
-function toForm(obj) {
-  return Object.entries(obj)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-    .join("&");
-}
-
-async function fetchApiFromBrowser(page, formBody) {
-  const res = await page.evaluate(async ({ url, body }) => {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "x-requested-with": "XMLHttpRequest",
-        accept: "application/json, text/javascript, */*; q=0.01"
-      },
-      body
-    });
-    const text = await r.text();
-    return { status: r.status, text };
-  }, { url: API_URL, body: formBody });
-
-  if (res.status !== 200) {
-    throw new Error(`API status ${res.status}: ${res.text.slice(0, 300)}`);
-  }
-
-  if (res.text.trim().startsWith("<")) {
-    throw new Error(`API returned HTML (Cloudflare): ${res.text.slice(0, 300)}`);
-  }
-
-  return JSON.parse(res.text);
-}
 
 async function main() {
   const fetched_at = new Date().toISOString();
   const allRecords = [];
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--disable-blink-features=AutomationControlled"]
-  });
-
+  const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     locale: "en-US",
-    viewport: { width: 1366, height: 768 }
+    viewport: { width: 1366, height: 768 },
   });
-
   const page = await context.newPage();
 
-  // Заходим на страницу, чтобы пройти CF в браузерном контексте
+  // Открываем страницу, чтобы пройти CF в браузерном контексте
   await page.goto(SPEC_PAGE, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(6000);
 
   for (const acc of ACCOUNTS) {
-    const body = toForm({ ...BASE_FORM, type_account: acc.type_account });
-    const data = await fetchApiFromBrowser(page, body);
+    const form = { ...BASE_FORM, type_account: acc.type_account };
 
-    for (const [symbol, v] of Object.entries(data)) {
+    const resp = await page.request.post(API_URL, {
+      headers: {
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "x-requested-with": "XMLHttpRequest",
+        accept: "application/json, text/javascript, */*; q=0.01",
+        referer: SPEC_PAGE,
+      },
+      form,
+    });
+
+    const status = resp.status();
+    const text = await resp.text();
+
+    console.log(`[${acc.account_type}] API status:`, status);
+
+    if (status !== 200) {
+      console.log(`[${acc.account_type}] non-200 body:`, text.slice(0, 300));
+      continue;
+    }
+    if (text.trim().startsWith("<")) {
+      console.log(`[${acc.account_type}] got HTML (CF?):`, text.slice(0, 300));
+      continue;
+    }
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      console.log(`[${acc.account_type}] JSON parse error. Body:`, text.slice(0, 300));
+      continue;
+    }
+
+    const keys = Object.keys(data || {});
+    console.log(`[${acc.account_type}] keys:`, keys.slice(0, 10));
+
+    let added = 0;
+    for (const [symbol, v] of Object.entries(data || {})) {
       if (!v || typeof v !== "object") continue;
       if (v.spread === undefined || v.swap_long === undefined || v.swap_short === undefined) continue;
 
@@ -93,34 +90,35 @@ async function main() {
         spread: v.spread,
         swap_long: v.swap_long,
         swap_short: v.swap_short,
-        source: `${API_URL} (type_account=${acc.type_account})`
+        source: `${API_URL} (type_account=${acc.type_account})`,
       });
+      added++;
     }
+
+    console.log(`[${acc.account_type}] added records:`, added);
   }
 
   await browser.close();
 
-  // Токен кладём в BODY, чтобы n8n точно видел $json.token
-  const payload = {
-    token: N8N_TOKEN,
-    fetched_at,
-    records: allRecords
-  };
-
-  // Диагностика: покажет hostname в логах Actions
   console.log("Webhook host:", new URL(N8N_WEBHOOK_URL).hostname);
   console.log("Records:", allRecords.length);
 
-  const resp = await fetch(N8N_WEBHOOK_URL, {
+  const payload = {
+    token: N8N_TOKEN,
+    fetched_at,
+    records: allRecords,
+  };
+
+  const r = await fetch(N8N_WEBHOOK_URL, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
   });
 
-  const text = await resp.text();
-  if (!resp.ok) throw new Error(`Webhook error ${resp.status}: ${text.slice(0, 500)}`);
+  const out = await r.text();
+  if (!r.ok) throw new Error(`Webhook error ${r.status}: ${out.slice(0, 500)}`);
 
-  console.log(`OK: sent ${allRecords.length} records to n8n. Response: ${text.slice(0, 200)}`);
+  console.log(`OK: sent ${allRecords.length} records to n8n.`);
 }
 
 main().catch((e) => {
